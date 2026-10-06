@@ -10,8 +10,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app import api, payloads
-from app.db import close_pool, init_db
+from app import api, payloads, repository as repo
+from app.config import settings
+from app.db import close_pool, get_pool, init_db
 from app.keyring import get_keyring
 from app.objectstore import init_object_store
 
@@ -20,9 +21,39 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
+log = logging.getLogger("webhook.api")
+
 OWNER_ID = (
     f"api:{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 )
+
+
+async def cancel_sweep_loop() -> None:
+    """API 进程后台任务：独立终结“已撤销事件 + 租约已过期”的在飞投递。
+
+    Worker 存活时，claim_delivery 每轮认领事务开头已执行同一清理（同一
+    仓储函数、并发安全且幂等）；本任务保证 Worker 全部停止（或长期无
+    认领）时，撤销后才过期的 in_flight 投递仍会在租约到期后被终结为
+    cancelled 并清空租约，不会在投递查询中长期滞留 in_flight。
+
+    只翻转租约已过期的行：租约未过期的在飞请求（仍可能成功结算）绝不
+    被提前取消。单批未扫完时同轮续扫、被并发锁跳过的行留待下一周期，
+    见 repository.sweep_expired_cancelled_in_flight_round。
+    """
+    pool = get_pool()
+    interval = settings.cancel_sweep_interval_seconds
+    log.info("撤销事件过期在飞投递的后台清理任务已启动（间隔 %ss）", interval)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            async with pool.acquire() as conn:
+                n = await repo.sweep_expired_cancelled_in_flight_round(conn)
+            if n:
+                log.info("后台清理终结 %s 条已撤销事件的过期在飞投递", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 后台任务不能因单轮失败退出
+            log.exception("撤销事件过期在飞投递清理失败")
 
 
 @asynccontextmanager
@@ -35,14 +66,18 @@ async def lifespan(app: FastAPI):
     get_keyring()
     # 提交状态机后台恢复：崩溃/重启残留的“已登记/已上传未终结”提交由此续跑。
     recovery_task = asyncio.create_task(payloads.recovery_loop(OWNER_ID))
+    # 撤销事件过期在飞投递的后台清理：Worker 停止时仍独立终结到期投递。
+    sweep_task = asyncio.create_task(cancel_sweep_loop())
     try:
         yield
     finally:
-        recovery_task.cancel()
-        try:
-            await recovery_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+        for task in (recovery_task, sweep_task):
+            task.cancel()
+        for task in (recovery_task, sweep_task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         await close_pool()
 
 

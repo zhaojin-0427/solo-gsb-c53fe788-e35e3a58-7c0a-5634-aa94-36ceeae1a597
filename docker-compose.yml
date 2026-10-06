@@ -68,6 +68,9 @@ services:
       S3_REGION: ${S3_REGION:-us-east-1}
       PAYLOAD_MAX_BYTES: ${PAYLOAD_MAX_BYTES:-1048576}
       PAYLOAD_GC_GRACE_SECONDS: ${PAYLOAD_GC_GRACE_SECONDS:-3600}
+      # 撤销事件过期在飞投递的后台清理巡检间隔（秒）：Worker 全部停止时，
+      # API 进程仍独立把到期投递终结为 cancelled 并清空租约
+      CANCEL_SWEEP_INTERVAL_SECONDS: ${CANCEL_SWEEP_INTERVAL_SECONDS:-5}
     volumes:
       - ${WEBHOOK_KEYRING_HOST_FILE:-./deploy/dev-keyring.json}:/run/keyring/keyring.json:ro
     ports:

@@ -38,9 +38,12 @@
   成功后 Worker 绝不会再为该事件产生新租约（撤销与认领按“事件行 → 订阅
   行 → 投递行”锁序串行）；撤销前**已认领且租约未过期（in_flight）的请求
   仍可完成**——成功仍记 `succeeded`，失败则转 `cancelled`，不再重试、不入
-  死信。撤销后才过期的在飞投递由 Worker 每轮认领事务内的**过期清理**终结
-  （不经过候选选择，**暂停/停用订阅下同样生效**），投递查询不会滞留
-  `in_flight`；清理幂等、不新增尝试记录，旧租约令牌的回写不会覆盖终态。
+  死信。撤销后才过期的在飞投递由**过期清理**终结（不经过候选选择，
+  **暂停/停用订阅下同样生效**）：清理由两个相互独立的触发点驱动——Worker
+  每轮认领事务内，以及 **API 进程的后台周期任务**（间隔
+  `CANCEL_SWEEP_INTERVAL_SECONDS`，默认 5 秒）——因此 **Worker 全部停止、
+  无人查询时到期投递仍会被独立终结**，投递查询不会滞留 `in_flight`；
+  清理幂等、不新增尝试记录，旧租约令牌的回写不会覆盖终态。
   撤销后该事件的**死信重放被拒绝（409）**；已有成功、死信、每次尝试历史
   与载荷对象引用全部保留，**其他事件仍按原顺序投递**。重复撤销幂等，未知
   事件 404；撤销后以同一 `source/event_id` 重复提交只返回原事件（带
@@ -316,10 +319,14 @@ HTTP/1.1 404 Not Found
   返回成功仍结算为 `succeeded`；请求失败则结算为 `cancelled`，
   **不再退避重试、不进入死信**；
 - **过期在飞投递不滞留**：撤销时刻租约已过期的 `in_flight` 投递随撤销事务
-  直接终结；撤销后才过期的，由 Worker 每轮认领事务内的**过期清理**终结为
-  `cancelled` 并清除租约——清理不经过认领的候选选择（候选选择会过滤暂停/
-  停用订阅），因此**暂停或停用订阅下 worker 未结算的过期在飞投递同样会被
-  终结**，`GET /api/v1/events/{id}/deliveries` 不会长期滞留 `in_flight`。
+  直接终结；撤销后才过期的，由**过期清理**终结为 `cancelled` 并清除租约——
+  清理不经过认领的候选选择（候选选择会过滤暂停/停用订阅），因此**暂停或
+  停用订阅下 worker 未结算的过期在飞投递同样会被终结**，
+  `GET /api/v1/events/{id}/deliveries` 不会长期滞留 `in_flight`。清理有两
+  个相互独立的触发点：Worker 每轮认领事务开头，以及 **API 进程的后台周期
+  任务**（间隔 `CANCEL_SWEEP_INTERVAL_SECONDS`，默认 5 秒）——**Worker
+  全部停止、无人查询时，到期投递仍由 API 进程独立终结**；单批未扫完时同轮
+  续扫，被并发结算/认领持锁的行本轮跳过、下一周期回访，最终必然终结。
   清理幂等：不新增尝试记录、不改变 `attempts_made`、重复执行无副作用；
   清理后旧租约令牌的回写（记录尝试/结算）被租约栅栏作废，不覆盖终态；
 - 已是 `succeeded` / `dead_lettered` 的投递、每次尝试历史（attempts）、事件
@@ -432,9 +439,19 @@ Worker 认领投递后宕机/失联且租约到期时，该投递处于“`in_fl
 租约”。若订阅随后被暂停（或停用），此类投递永远不会被认领接管（认领的
 候选选择会过滤暂停/停用订阅）——撤销该事件时，仓储在撤销事务内把
 **租约已过期的 in_flight 投递一并终结**；撤销时租约尚未过期的，到期后由
-Worker 每轮认领事务内的过期清理终结（不经过候选选择，暂停/停用订阅同样
-生效）。两条路径都不新增尝试记录、清除租约字段，因此投递查询不会长期
-滞留 `in_flight`：
+**过期清理**终结（不经过候选选择，暂停/停用订阅同样生效）。过期清理由
+两个相互独立的触发点驱动：
+
+1. **Worker 每轮认领事务开头**（`claim_delivery` 内）；
+2. **API 进程的后台周期任务**（`cancel_sweep_loop`，间隔
+   `CANCEL_SWEEP_INTERVAL_SECONDS`，默认 5 秒）——即使 **Worker 全部
+   停止、也没有任何查询请求**，到期投递仍由 API 进程独立终结为
+   `cancelled` 并清空租约。单批（200 条）未扫完时同轮续扫；被并发
+   结算/认领持锁的行本轮跳过、下一周期回访，最终必然终结。
+
+两条路径是同一仓储函数（`sweep_expired_cancelled_in_flight`），并发安全
+且幂等：不新增尝试记录、清除租约字段，因此投递查询不会长期滞留
+`in_flight`：
 
 ```bash
 # 前提：订阅已暂停（POST /subscriptions/3/pause），其投递 21 被某 Worker
@@ -506,9 +523,10 @@ $ curl -s localhost:8000/api/v1/deliveries/21/attempts
 ```
 
 若撤销时租约尚未过期（在飞请求仍可能成功），投递保持 `in_flight` 不动；
-待租约到期后，任一存活 Worker 的下一轮认领事务即把它终结为 `cancelled`
-（清理幂等，重复执行不新增尝试、不重试）。旧租约令牌迟到的回写（记录
-尝试/结算）会被 `leased_by = NULL` 栅栏作废，不会覆盖 `cancelled` 终态。
+待租约到期后，任一存活 Worker 的下一轮认领事务、或 API 进程的后台清理
+任务（Worker 全部停止时由它独立兜底）即把它终结为 `cancelled`（清理幂等，
+重复执行不新增尝试、不重试）。旧租约令牌迟到的回写（记录尝试/结算）会被
+`leased_by = NULL` 栅栏作废，不会覆盖 `cancelled` 终态。
 
 #### 撤销边界如何与认领 / 结算 / 清理 / 重放串行
 
@@ -528,9 +546,11 @@ $ curl -s localhost:8000/api/v1/deliveries/21/attempts
 - **撤销 ↔ 结算**：结算按“投递行 → 事件行”加锁，事件行锁与撤销互斥：
   撤销先提交时，失败结算读到事件已撤销即落 `cancelled`（不退避/不重试/
   不入死信），成功结算不受影响仍记 `succeeded`；
-- **过期清理 ↔ 撤销 / 结算 / 认领**：每次认领事务开头先执行过期清理
-  （`sweep_expired_cancelled_in_flight`），把“事件已撤销 + 租约已过期”的
-  `in_flight` 投递终结为 `cancelled` 并清除租约。清理只锁投递行
+- **过期清理 ↔ 撤销 / 结算 / 认领**：过期清理
+  （`sweep_expired_cancelled_in_flight`）把“事件已撤销 + 租约已过期”的
+  `in_flight` 投递终结为 `cancelled` 并清除租约，由两个独立触发点驱动：
+  Worker 每次认领事务开头，以及 API 进程的后台周期任务（Worker 全部停止
+  时仍独立运行）。清理只锁投递行
   （`FOR UPDATE SKIP LOCKED`），对事件撤销状态做非加锁快照读，不锁事件行/
   订阅行，与任何路径都不构成等待环；被并发结算/认领持锁的行本轮跳过、
   下轮再清。清理不经过认领的候选选择，因此**暂停/停用订阅下永远不会被
@@ -1294,6 +1314,7 @@ WEBHOOK_ALLOWED_HOSTS=receiver,127.0.0.1,localhost docker compose up --build
 | `LEASE_SECONDS` | `30` | 认领租约时长；过期可被接管 |
 | `HTTP_TIMEOUT_SECONDS` | `10` | 单次投递 HTTP 超时（应小于租约） |
 | `WORKER_POLL_SECONDS` | `1` | 无任务时 Worker 轮询间隔 |
+| `CANCEL_SWEEP_INTERVAL_SECONDS` | `5` | API 进程后台清理巡检间隔：撤销事件后才过期的 in_flight 投递，Worker 全部停止时由 API 独立终结为 `cancelled` 并清空租约 |
 | `MAX_ATTEMPTS` | `6` | 最大尝试次数，达到后进死信；仅作新建订阅 revision=1 的默认值，发布版本可按订阅覆盖 |
 | `BACKOFF_BASE_SECONDS` | `5` | 指数退避基数：`base*2^(n-1)`；同上，可被版本覆盖 |
 | `BACKOFF_CAP_SECONDS` | `300` | 退避间隔上限；同上，可被版本覆盖 |
@@ -1397,7 +1418,7 @@ python -m app.payloadadmin migrate
 python -m app.payloadadmin gc --rescan-store
 ```
 
-仓库还包含五个本地验证脚本（非 Docker 依赖，会自动拉起便携 PostgreSQL；
+仓库还包含九个本地验证脚本（非 Docker 依赖，会自动拉起便携 PostgreSQL；
 载荷对象用本地文件后端 `PAYLOAD_STORE_MODE=local`，无需 MinIO）：
 
 - `test_e2e.py`：完整四进程拓扑，覆盖幂等、顺序、退避死信、重放、租约接管、
@@ -1431,3 +1452,16 @@ python -m app.payloadadmin gc --rescan-store
   租约照常结算、暂停后再无新租约），以及 HTTP 端到端：暂停查询、暂停期间
   仍建 pending 投递并钉住当时配置版本、恢复后沿原 seq/not_before/尝试次数
   继续、重复操作幂等、未知订阅 404、暂停期间死信重放与严格顺序语义不变。
+- `test_event_cancel.py`：事件撤销专项——撤销与认领/结算/重放的确定性
+  事务交错（撤销先提交则认领放弃租约并翻转候选；认领先提交则在途请求成功
+  仍 `succeeded`、失败转 `cancelled`；撤销后死信重放拒绝），过期在飞投递
+  的两条终结路径（撤销事务直接终结已过期行、清理终结撤销后才过期行）与
+  清理幂等/旧令牌栅栏，以及四进程 HTTP 端到端：撤销 API、幂等、404、
+  重复提交不复活、暂停订阅下过期在飞投递不滞留 `in_flight`、其他事件
+  严格顺序不变、尝试历史与载荷引用保留。
+- `test_cancel_sweep.py`：撤销后过期在飞投递的独立后台清理专项——
+  `sweep_expired_cancelled_in_flight_round` 单批未扫完同轮续扫、并发锁
+  跳过行下一周期回访、未过期行绝不提前清理；以及只起 API、不起 Worker 的
+  HTTP 端到端：撤销时租约未过期的在飞投递保留，租约到期后无人查询也由
+  API 后台任务（`CANCEL_SWEEP_INTERVAL_SECONDS`）独立终结为 `cancelled`
+  并清空租约，清理幂等不新增尝试，未撤销事件的投递不受影响。

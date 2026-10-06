@@ -11,6 +11,10 @@ __pycache__/
 .test-pgdata-pause-db/
 .test-pgdata-cancel/
 .test-pgdata-cancel-db/
+.test-pgdata-sweep-db/
+.test-pgdata-sweep-http/
+.test-payloads-cancel/
+.test-payloads-sweep/
 .gc-pgdata-*/
 .gc-store-*/
 .test-payloads/

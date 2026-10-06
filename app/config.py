@@ -79,6 +79,12 @@ class Settings:
     payload_stale_age_seconds: float = _get_float(
         "PAYLOAD_STALE_AGE_SECONDS", 60
     )
+    # API 进程内“已撤销事件的过期在飞投递”后台清理巡检间隔（秒）：
+    # Worker 存活时认领事务内已做同一清理；本任务保证 Worker 全部停止时，
+    # 撤销后才过期的 in_flight 投递仍被独立终结为 cancelled 并清空租约。
+    cancel_sweep_interval_seconds: float = _get_float(
+        "CANCEL_SWEEP_INTERVAL_SECONDS", 5
+    )
 
 
 settings = Settings()

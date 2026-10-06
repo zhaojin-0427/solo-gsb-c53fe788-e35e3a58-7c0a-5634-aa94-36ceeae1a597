@@ -60,7 +60,9 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 #   成功仍记 succeeded，失败（settle 在事件行锁复核到撤销）一律转
 #   cancelled，不再重试、不入死信；
 # - 撤销后才过期的 in_flight 投递由清理路径终结
-#   （repository.sweep_expired_cancelled_in_flight，随每次认领事务执行）：
+#   （repository.sweep_expired_cancelled_in_flight，Worker 随每次认领事务
+#   执行；API 进程另有后台周期任务 cancel_sweep_loop 独立执行，Worker
+#   全部停止时到期投递仍会被清理）：
 #   不经过认领的候选选择（候选选择会过滤暂停/停用订阅），因此暂停或停用
 #   订阅下的过期在飞投递同样转 cancelled 并清除租约，不会滞留 in_flight；
 #   清理幂等（不新增尝试、不改 attempts_made），旧租约令牌的回写被

@@ -673,7 +673,13 @@ async def get_event(
 # - 清理（sweep_expired_cancelled_in_flight）只锁投递行（SKIP LOCKED），
 #   对事件撤销状态做非加锁快照读，不锁事件行/订阅行，与上述任何路径都
 #   不构成等待环；它终结“已撤销事件 + 租约已过期”的 in_flight 行，
-#   不经过认领的候选选择，因此暂停/停用订阅下的滞留行同样被清理。
+#   不经过认领的候选选择，因此暂停/停用订阅下的滞留行同样被清理。清理
+#   有两个相互独立的触发点（同一函数、同一事务语义，并发安全且幂等）：
+#     1. Worker 每次认领事务开头（claim_delivery）；
+#     2. API 进程的后台周期任务（app/main.py 的 cancel_sweep_loop，间隔
+#        CANCEL_SWEEP_INTERVAL_SECONDS）——Worker 全部停止或长期无认领
+#        时，撤销后才过期的 in_flight 投递仍由它独立终结，不会在投递
+#        查询中长期滞留 in_flight。
 # - 死信重放（replay_dead_letter）先锁死信投递行，再锁其事件行复核：
 #   已撤销事件一律拒绝重放（event_cancelled），不产生新链 pending 记录，
 #   旧成功/死信/尝试历史与载荷引用全部保留。
@@ -689,8 +695,11 @@ async def get_event(
 # 接管；为此存在两条不经过候选选择的终结路径——
 #   1. cancel_event 在撤销事务内直接翻转“撤销时刻租约已过期”的 in_flight
 #      行（未过期行不动：撤销前已认领的请求继续飞行，成功仍记 succeeded）；
-#   2. sweep_expired_cancelled_in_flight 在每次认领事务开头清理“撤销后才
-#      过期”的 in_flight 行（Worker 每轮轮询都执行，不看订阅 active/paused）。
+#   2. sweep_expired_cancelled_in_flight 清理“撤销后才过期”的 in_flight
+#      行，由两个独立触发点驱动（不看订阅 active/paused）：Worker 每轮
+#      认领事务开头，以及 API 进程的后台周期任务（cancel_sweep_loop）。
+#      后者保证 Worker 全部停止、无人查询时清理仍然运行，到期投递最终
+#      终结为 cancelled 并清空租约。
 # 清理与 record_attempt/settle_delivery 的交错由租约栅栏裁决：清理先提交
 # 则旧租约令牌的回写读到 leased_by=NULL 即作废（不新增尝试、不覆盖终态）；
 # 回写先提交则尝试历史保留，清理随后仍把该过期行翻转为 cancelled。清理
@@ -711,8 +720,9 @@ async def cancel_event(
     - 租约未过期的 in_flight 投递不在翻转集合：撤销前已认领且仍在租约内的
       请求继续飞行，其结算在事件行锁复核处裁决（成功→succeeded，失败→
       cancelled）；撤销后才过期的 in_flight 行由清理路径
-      （sweep_expired_cancelled_in_flight，随每次认领事务执行，不看订阅
-      暂停/停用状态）终结为 cancelled 并清除租约。
+      （sweep_expired_cancelled_in_flight，Worker 每次认领事务内与 API
+      进程后台周期任务都会执行，不看订阅暂停/停用状态）终结为 cancelled
+      并清除租约。
       对投递行的 UPDATE 使用 SKIP LOCKED：正被并发认领/结算持锁的行由该
       认领/结算自身的撤销复核（或随后的清理）终结，这里不等待，避免与
       认领/结算形成锁等待环。
@@ -884,6 +894,35 @@ async def sweep_expired_cancelled_in_flight(
             limit,
         )
     return int(result.split()[-1])
+
+
+# 后台清理单轮最多连续执行的批数：滞留行异常多时避免单轮事务链过长，
+# 剩余行由调用方的周期调度在下一轮继续（周期性重试保证最终终结）。
+_SWEEP_ROUND_MAX_BATCHES = 25
+
+
+async def sweep_expired_cancelled_in_flight_round(
+    conn: asyncpg.Connection, *, max_batches: int = _SWEEP_ROUND_MAX_BATCHES
+) -> int:
+    """执行一轮过期在飞清理，返回本轮终结的总行数。
+
+    供 API 进程的后台周期任务（app/main.py 的 cancel_sweep_loop）调用：
+
+    - 单批达到上限（_SWEEP_EXPIRED_LIMIT）说明可能还有剩余，同轮立即接续
+      下一批，直到单批未满（含 0）——即“单批未扫完时同轮续扫”；
+    - 被并发结算/认领持锁而 SKIP LOCKED 跳过的行不计入返回：本轮不再
+      原地重试（避免空转），由调用方的周期调度在下一轮回访，届时行锁
+      早已释放，仍会被终结；
+    - 批数达到 max_batches 仍未扫完时返回已清理数，剩余行同样留给下一
+      周期，防止异常多的滞留行让单轮占用连接过久。
+    """
+    total = 0
+    for _ in range(max_batches):
+        n = await sweep_expired_cancelled_in_flight(conn)
+        total += n
+        if n < _SWEEP_EXPIRED_LIMIT:
+            break
+    return total
 
 
 # -- Worker：认领队首任务 --------------------------------------------------------
