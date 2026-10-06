@@ -68,6 +68,10 @@ services:
       S3_REGION: ${S3_REGION:-us-east-1}
       PAYLOAD_MAX_BYTES: ${PAYLOAD_MAX_BYTES:-1048576}
       PAYLOAD_GC_GRACE_SECONDS: ${PAYLOAD_GC_GRACE_SECONDS:-3600}
+      # 撤销事件“后到期”在飞投递的独立清理（API 进程后台巡检）：Worker 全部
+      # 停止时，到期投递仍由 api 终结为 cancelled 并清空租约
+      CANCEL_SWEEP_INTERVAL_SECONDS: ${CANCEL_SWEEP_INTERVAL_SECONDS:-5}
+      CANCEL_SWEEP_BATCH_SIZE: ${CANCEL_SWEEP_BATCH_SIZE:-200}
     volumes:
       - ${WEBHOOK_KEYRING_HOST_FILE:-./deploy/dev-keyring.json}:/run/keyring/keyring.json:ro
     ports:

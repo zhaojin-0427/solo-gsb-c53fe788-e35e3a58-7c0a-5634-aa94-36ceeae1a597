@@ -80,5 +80,18 @@ class Settings:
         "PAYLOAD_STALE_AGE_SECONDS", 60
     )
 
+    # ---- 撤销事件“后到期”在飞投递的独立清理（API 进程后台任务）----
+    # 撤销只终结 pending 与撤销时刻已过期的 in_flight 投递；撤销后才过期的
+    # 在飞投递除 Worker 认领事务内的清理外，还由 API 进程按此间隔独立巡检
+    # 终结——Worker 全部停止（API 仍存活）时，到期投递同样最终转为
+    # cancelled 并清空租约，投递查询不会滞留 in_flight。
+    cancel_sweep_interval_seconds: float = _get_float(
+        "CANCEL_SWEEP_INTERVAL_SECONDS", 5
+    )
+    # 单次清理批大小：满批（== 批大小）说明剩余集合可能未扫完，同轮立即
+    # 续批；短批结束本轮。被并发结算/认领持锁而跳过的行仍在剩余集合中
+    # （清理不消费游标，每批都重新查询剩余集合），下一轮巡检回访。
+    cancel_sweep_batch_size: int = _get_int("CANCEL_SWEEP_BATCH_SIZE", 200)
+
 
 settings = Settings()

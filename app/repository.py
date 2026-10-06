@@ -674,6 +674,9 @@ async def get_event(
 #   对事件撤销状态做非加锁快照读，不锁事件行/订阅行，与上述任何路径都
 #   不构成等待环；它终结“已撤销事件 + 租约已过期”的 in_flight 行，
 #   不经过认领的候选选择，因此暂停/停用订阅下的滞留行同样被清理。
+#   清理由两条互不影响的路径驱动：Worker 每次认领事务开头，以及 API
+#   进程内的独立后台巡检（app/sweeper.py）——Worker 全部停止时后者
+#   仍保证到期投递最终转为 cancelled。
 # - 死信重放（replay_dead_letter）先锁死信投递行，再锁其事件行复核：
 #   已撤销事件一律拒绝重放（event_cancelled），不产生新链 pending 记录，
 #   旧成功/死信/尝试历史与载荷引用全部保留。
@@ -689,8 +692,10 @@ async def get_event(
 # 接管；为此存在两条不经过候选选择的终结路径——
 #   1. cancel_event 在撤销事务内直接翻转“撤销时刻租约已过期”的 in_flight
 #      行（未过期行不动：撤销前已认领的请求继续飞行，成功仍记 succeeded）；
-#   2. sweep_expired_cancelled_in_flight 在每次认领事务开头清理“撤销后才
-#      过期”的 in_flight 行（Worker 每轮轮询都执行，不看订阅 active/paused）。
+#   2. sweep_expired_cancelled_in_flight 清理“撤销后才过期”的 in_flight
+#      行，由 Worker 每轮认领事务与 API 进程后台巡检（app/sweeper.py，
+#      不看订阅 active/paused）两路独立驱动——Worker 全部停止、仅 API
+#      存活时，到期投递同样最终转为 cancelled 并清空租约。
 # 清理与 record_attempt/settle_delivery 的交错由租约栅栏裁决：清理先提交
 # 则旧租约令牌的回写读到 leased_by=NULL 即作废（不新增尝试、不覆盖终态）；
 # 回写先提交则尝试历史保留，清理随后仍把该过期行翻转为 cancelled。清理
@@ -711,8 +716,9 @@ async def cancel_event(
     - 租约未过期的 in_flight 投递不在翻转集合：撤销前已认领且仍在租约内的
       请求继续飞行，其结算在事件行锁复核处裁决（成功→succeeded，失败→
       cancelled）；撤销后才过期的 in_flight 行由清理路径
-      （sweep_expired_cancelled_in_flight，随每次认领事务执行，不看订阅
-      暂停/停用状态）终结为 cancelled 并清除租约。
+      （sweep_expired_cancelled_in_flight，随每次认领事务执行，并由 API
+      进程后台巡检独立驱动——Worker 停止时同样生效，不看订阅暂停/停用
+      状态）终结为 cancelled 并清除租约。
       对投递行的 UPDATE 使用 SKIP LOCKED：正被并发认领/结算持锁的行由该
       认领/结算自身的撤销复核（或随后的清理）终结，这里不等待，避免与
       认领/结算形成锁等待环。
@@ -830,7 +836,8 @@ async def _claim_cancel_candidate(
 
 
 # 单次认领事务内清理的过期在飞行投递上限：批量足够大以跟上滞留速度，
-# 又避免偶发大量滞留时认领事务过长（剩余行下一轮轮询继续清理）。
+# 又避免偶发大量滞留时认领事务过长（剩余行下一轮轮询继续清理；API 后台
+# 巡检 sweeper.sweep_until_idle 会在满批时同轮续批）。
 _SWEEP_EXPIRED_LIMIT = 200
 
 
@@ -843,6 +850,10 @@ async def sweep_expired_cancelled_in_flight(
     候选选择**（候选选择会过滤暂停/停用订阅，其过期行永远不会被选中接管），
     因此暂停或停用订阅下“worker 未结算且租约已到期”的投递也能转 cancelled
     并清除租约，不会在投递查询中长期滞留 in_flight。
+
+    驱动方：Worker 每次认领事务开头（claim_delivery），以及 API 进程内的
+    独立后台巡检（app/sweeper.cancel_sweep_loop）——后者保证 Worker 全部
+    停止、仅 API 存活时到期投递仍最终被清理。
 
     - 只锁投递行（FOR UPDATE SKIP LOCKED），对 events.cancelled_at 做非加锁
       快照读，不锁事件行/订阅行：与撤销（事件→订阅→投递）、结算（投递→

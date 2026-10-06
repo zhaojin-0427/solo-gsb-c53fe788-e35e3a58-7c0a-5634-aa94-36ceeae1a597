@@ -8,13 +8,16 @@ Part A：确定性数据库交错测试——撤销（cancel_event）与认领�
         以及过期在飞投递的清理（sweep_expired_cancelled_in_flight）：
         撤销直接终结已过期 in_flight；暂停/停用订阅下无需认领即终结；
         清理幂等（不新增尝试）；旧租约令牌不得覆盖终态；未过期请求的
-        成功结算保留；与 record_attempt 持锁的 SKIP LOCKED 交错。
+        成功结算保留；与 record_attempt 持锁的 SKIP LOCKED 交错；
+        API 后台巡检的 sweep_until_idle 满批同轮续批、重复清理幂等。
 Part B：四进程 HTTP 端到端（api + receiver + 双 worker）：撤销 API、
         pending 批量 cancelled、查询展示撤销时刻/终态、幂等、404、
         重复提交不复活、撤销后拒绝死信重放、已认领在途请求的成功/失败
         结算语义、暂停订阅下过期在飞投递的撤销终结与轮询清理（投递查询
         不再滞留 in_flight）、其他事件严格顺序不受影响、attempts/载荷
-        引用保留。
+        引用保留；最后停掉全部 Worker，验证 API 进程后台巡检独立清理
+        “撤销后才过期”的在飞投递（租约未过期绝不提前清理，到期后无需
+        Worker 即转 cancelled 并清空租约）。
 """
 from __future__ import annotations
 
@@ -43,6 +46,9 @@ COMMON_ENV = {
     "MAX_ATTEMPTS": "6",
     "BACKOFF_BASE_SECONDS": "1",
     "BACKOFF_CAP_SECONDS": "8",
+    # API 进程后台清理巡检间隔调小，端到端可快速观察到独立清理生效
+    "CANCEL_SWEEP_INTERVAL_SECONDS": "0.2",
+    "CANCEL_SWEEP_BATCH_SIZE": "200",
     "RECEIVER_SECRET": "dev-signing-secret",
     "RECEIVER_TIMESTAMP_TOLERANCE_SECONDS": "600",
     "WEBHOOK_ALLOWED_HOSTS": "127.0.0.1,localhost",
@@ -519,6 +525,63 @@ async def _db_interleaving_tests(dsn: str) -> None:
         f"n={n14} att={att14} settle={stl14}",
     )
 
+    # 交错 15：单批未扫完时同轮续批（sweep_until_idle）——5 条过期在飞、
+    # 批大小 2，一轮调用应全部终结；再次调用幂等返回 0。
+    from app import sweeper
+
+    # 先建 5 个“事件已撤销”的投递：seed 的租约 60s 前已过期，撤销事务会
+    # 直接终结它们；随后统一改回 in_flight + 已过期租约，构造出 5 个
+    # “撤销后才过期、待清理”的现场，专门验证 sweep 的续批。
+    batch_ids = []
+    for i in range(5):
+        beid, _bsid, bdid = await _seed(
+            conn, f"cancel-batch-{i}", status="in_flight",
+            lease=f"batch-worker-{i}", lease_age_seconds=60.0,
+        )
+        await repo.cancel_event(conn, beid)
+        batch_ids.append(bdid)
+    for i, bdid in enumerate(batch_ids):
+        await conn.execute(
+            """
+            UPDATE deliveries
+            SET status='in_flight', leased_by=$2,
+                leased_at=now() - interval '90 seconds',
+                lease_expires_at=now() - interval '1 second'
+            WHERE id=$1
+            """,
+            bdid, f"batch-worker-{i}",
+        )
+    n_round = await sweeper.sweep_until_idle(conn, limit=2)
+    statuses = [
+        await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", d)
+        for d in batch_ids
+    ]
+    leases = [
+        await conn.fetchval("SELECT leased_by FROM deliveries WHERE id=$1", d)
+        for d in batch_ids
+    ]
+    check(
+        "交错15: 满批同轮续批，一轮清理终结全部 5 条（批大小 2）",
+        n_round == 5 and all(s == "cancelled" for s in statuses)
+        and all(lb is None for lb in leases),
+        f"n={n_round} statuses={statuses}",
+    )
+    check(
+        "交错15: 清理不新增尝试记录",
+        all(
+            c == 0
+            for c in [
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM delivery_attempts WHERE delivery_id=$1",
+                    d,
+                )
+                for d in batch_ids
+            ]
+        ),
+    )
+    n_again = await sweeper.sweep_until_idle(conn, limit=2)
+    check("交错15: 重复清理幂等（0 行）", n_again == 0)
+
     await conn.close()
 
 
@@ -614,6 +677,7 @@ def expire_lease_now(dsn: str, delivery_id: int) -> None:
 class Harness:
     def __init__(self) -> None:
         self.procs: list[subprocess.Popen] = []
+        self.worker_procs: list[subprocess.Popen] = []
 
     def spawn(self, module_cmd: list[str], name: str):
         env = os.environ.copy()
@@ -625,6 +689,8 @@ class Harness:
             cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
         )
         self.procs.append(proc)
+        if name.startswith("worker"):
+            self.worker_procs.append(proc)
 
     def start(self):
         self.pg = pgserver.get_server(
@@ -648,9 +714,25 @@ class Harness:
         wait_http(f"{self.api}/health")
         wait_http(f"{self.rcv}/health")
 
+    def stop_workers(self) -> None:
+        """只停止全部 Worker（API 保持存活），模拟“Worker 全部宕机”现场。"""
+        for p in self.worker_procs:
+            if p.returncode is None:
+                p.send_signal(signal.SIGTERM)
+        for p in self.worker_procs:
+            try:
+                p.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
     def stop(self):
         for p in self.procs:
-            p.send_signal(signal.SIGTERM)
+            if p.returncode is not None:
+                continue
+            try:
+                p.send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                continue
         for p in self.procs:
             try:
                 p.wait(timeout=8)
@@ -985,6 +1067,72 @@ def run_http_tests(h: Harness) -> None:
           status["total_references"] >= 4 and status["payload_objects"] >= 1,
           json.dumps({k: status[k] for k in
                       ("total_events", "payload_objects", "total_references")}))
+
+    # ---- Worker 全部停止时，API 进程独立清理撤销后过期的在飞投递 ----
+    # 撤销 API 只终结 pending 与已过期投递；撤销时租约未过期的 in_flight 投递
+    # 原只能等 Worker 认领事务内的清理。本场景停掉全部 Worker，验证 API 后台
+    # 巡检独立把到期投递终结为 cancelled（且租约未过期时绝不提前清理）。
+    nostaff_sub = api.post("/api/v1/subscriptions", json={
+        "source": "nostaff", "target_url": f"{h.rcv}/receive",
+        "secret": "dev-signing-secret",
+    }).json()
+    # 暂停订阅：保证 Worker 存活期间不会认领该投递（现场完全由改库构造）
+    api.post(f"/api/v1/subscriptions/{nostaff_sub['id']}/pause").raise_for_status()
+    nev = api.post("/api/v1/events", json={
+        "source": "nostaff", "event_id": "nostaff-1", "payload": {"w": 1},
+    }).json()
+    nd = wait_for(
+        lambda: next(
+            (d for d in api.get(f"/api/v1/events/{nev['id']}/deliveries").json()
+             if d["subscription_id"] == nostaff_sub["id"]),
+            None,
+        ),
+        "nostaff 投递建立",
+    )
+    # 模拟 Worker 认领后仍持租约（未过期），随后撤销事件
+    force_in_flight_lease(h.dsn, nd["id"], worker="doomed-worker", expired=False)
+    ncr = api.post(f"/api/v1/events/{nev['id']}/cancel")
+    check("Worker 将停场景：撤销 200", ncr.status_code == 200, ncr.text)
+    check(
+        "撤销时租约未过期：投递保留 in_flight",
+        api.get(f"/api/v1/deliveries/{nd['id']}").json()["status"] == "in_flight",
+    )
+    # 停掉全部 Worker（API 存活）；此后唯一的清理驱动是 API 后台巡检
+    h.stop_workers()
+    time.sleep(1.0)  # 远超巡检间隔 0.2s：租约未过期，绝不提前清理
+    still = api.get(f"/api/v1/deliveries/{nd['id']}").json()
+    check(
+        "Worker 已停且租约未过期：不提前取消（仍 in_flight）",
+        still["status"] == "in_flight" and still["leased_by"] == "doomed-worker",
+        json.dumps(still, ensure_ascii=False),
+    )
+    # 租约到期：无人认领、无人查询特定事件，API 后台巡检独立终结
+    expire_lease_now(h.dsn, nd["id"])
+    wait_for(
+        lambda: api.get(f"/api/v1/deliveries/{nd['id']}").json()["status"]
+        == "cancelled",
+        "Worker 停止后 API 后台清理终结过期在飞投递",
+        timeout=15,
+    )
+    fin_nd = api.get(f"/api/v1/deliveries/{nd['id']}").json()
+    check(
+        "API 独立清理后：终态 cancelled、租约字段清空、不新增尝试",
+        fin_nd["status"] == "cancelled" and fin_nd["leased_by"] is None
+        and fin_nd["leased_at"] is None and fin_nd["lease_expires_at"] is None
+        and fin_nd["attempts_made"] == 0
+        and api.get(f"/api/v1/deliveries/{nd['id']}/attempts").json() == [],
+        json.dumps(fin_nd, ensure_ascii=False),
+    )
+    check(
+        "事件投递查询不再滞留 in_flight（Worker 停止场景）",
+        all(d["status"] != "in_flight"
+            for d in api.get(f"/api/v1/events/{nev['id']}/deliveries").json()),
+    )
+    check(
+        "被清理的在飞投递从未真正发送（Worker 停止场景）",
+        len([x for x in rcv.get("/received", params={"limit": 500}).json()["items"]
+             if x["event_id"] == "nostaff-1"]) == 0,
+    )
 
 
 def main() -> int:

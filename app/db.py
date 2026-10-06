@@ -60,7 +60,9 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 #   成功仍记 succeeded，失败（settle 在事件行锁复核到撤销）一律转
 #   cancelled，不再重试、不入死信；
 # - 撤销后才过期的 in_flight 投递由清理路径终结
-#   （repository.sweep_expired_cancelled_in_flight，随每次认领事务执行）：
+#   （repository.sweep_expired_cancelled_in_flight，随每次认领事务执行，
+#   并由 API 进程后台巡检 app/sweeper.py 独立驱动——Worker 全部停止时
+#   到期投递同样被清理）：
 #   不经过认领的候选选择（候选选择会过滤暂停/停用订阅），因此暂停或停用
 #   订阅下的过期在飞投递同样转 cancelled 并清除租约，不会滞留 in_flight；
 #   清理幂等（不新增尝试、不改 attempts_made），旧租约令牌的回写被
@@ -380,9 +382,9 @@ def _schema_statements(
         CREATE INDEX IF NOT EXISTS idx_deliveries_event_status
             ON deliveries (event_id_fk, status)
         """,
-        # 过期在飞清理（sweep_expired_cancelled_in_flight 随每轮认领执行）：
-        # 部分索引只覆盖在飞行（通常很少），按租约到期时刻范围扫描，
-        # 避免每轮认领都全表扫 deliveries。
+        # 过期在飞清理（sweep_expired_cancelled_in_flight 随每轮认领与 API
+        # 后台巡检执行）：部分索引只覆盖在飞行（通常很少），按租约到期时刻
+        # 范围扫描，避免每轮清理都全表扫 deliveries。
         """
         CREATE INDEX IF NOT EXISTS idx_deliveries_in_flight_lease
             ON deliveries (lease_expires_at)

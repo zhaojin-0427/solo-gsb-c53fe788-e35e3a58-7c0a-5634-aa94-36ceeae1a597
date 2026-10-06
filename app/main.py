@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app import api, payloads
+from app import api, payloads, sweeper
 from app.db import close_pool, init_db
 from app.keyring import get_keyring
 from app.objectstore import init_object_store
@@ -35,14 +35,19 @@ async def lifespan(app: FastAPI):
     get_keyring()
     # 提交状态机后台恢复：崩溃/重启残留的“已登记/已上传未终结”提交由此续跑。
     recovery_task = asyncio.create_task(payloads.recovery_loop(OWNER_ID))
+    # 撤销事件过期在飞投递的独立清理：Worker 全部停止时，撤销后才过期的
+    # in_flight 投递仍由本任务终结为 cancelled 并清空租约（不滞留 in_flight）。
+    cancel_sweep_task = asyncio.create_task(sweeper.cancel_sweep_loop())
     try:
         yield
     finally:
         recovery_task.cancel()
-        try:
-            await recovery_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+        cancel_sweep_task.cancel()
+        for task in (recovery_task, cancel_sweep_task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         await close_pool()
 
 
